@@ -1,0 +1,1063 @@
+name: Security Pipeline (test) - inline scripts
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_scripts:
+        description: "Lancer l'agrégation/anonymisation/IA/reviewdog (scripts) ?"
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  pull-requests: write  # requis par reviewdog pour poster des commentaires inline
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - name: Run Semgrep
+        run: |
+          pip install semgrep
+          semgrep scan \
+            --config p/java \
+            --config p/spring \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/react \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --sarif --output semgrep.sarif . || true
+      - name: Show Semgrep results
+        run: cat semgrep.sarif
+      - name: Upload Semgrep SARIF
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sarif-semgrep
+          path: semgrep.sarif
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - name: Run Gitleaks
+        run: |
+          curl -sSL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          ./gitleaks detect --source . --report-format sarif --report-path gitleaks.sarif --no-git || true
+      - name: Show Gitleaks results
+        run: cat gitleaks.sarif
+      - name: Upload Gitleaks SARIF
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sarif-gitleaks
+          path: gitleaks.sarif
+
+  bearer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - name: Run Bearer
+        run: |
+          curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          bearer scan . --format sarif --output bearer.sarif --exit-code 0 || true
+      - name: Show Bearer results
+        run: cat bearer.sarif
+      - name: Upload Bearer SARIF
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sarif-bearer
+          path: bearer.sarif
+
+  pmd:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - name: Run PMD
+        run: |
+          curl -sSL -o pmd.zip https://github.com/pmd/pmd/releases/download/pmd_releases%2F7.7.0/pmd-dist-7.7.0-bin.zip
+          unzip -q pmd.zip
+          ./pmd-bin-7.7.0/bin/pmd check -d backend/ -R rulesets/java/quickstart.xml -f sarif -r pmd.sarif || true
+      - name: Show PMD results
+        run: cat pmd.sarif
+      - name: Upload PMD SARIF
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sarif-pmd
+          path: pmd.sarif
+
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Run OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'my-project'
+          path: '.'
+          format: 'SARIF'
+          out: 'reports'
+        env:
+          JAVA_HOME: /opt/jdk
+
+      - name: Move Dependency-Check SARIF
+        run: cp reports/dependency-check-report.sarif dependency-check.sarif
+
+      - name: Show Dependency-Check results
+        run: cat dependency-check.sarif
+
+      - name: Upload Dependency-Check SARIF
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sarif-dependency-check
+          path: dependency-check.sarif
+
+  trufflehog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0  # full history needed for TruffleHog to scan past commits
+
+      - name: Run TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+          trufflehog git file://. --json --no-update > trufflehog.jsonl || true
+      - name: Convert TruffleHog JSON to SARIF
+        run: |
+          cat > trufflehog_to_sarif.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          trufflehog_to_sarif.py
+          TruffleHog n'a pas de sortie SARIF native (seulement JSON/texte).
+          Ce script convertit trufflehog.jsonl (une ligne JSON par secret détecté)
+          en SARIF 2.1.0, pour rester compatible avec le reste du pipeline
+          (anonymize.py attend des fichiers SARIF en entrée).
+          Entrée : trufflehog.jsonl
+          Sortie : trufflehog.sarif
+          """
+          import json
+          import sys
+          from pathlib import Path
+          INPUT_FILE = "trufflehog.jsonl"
+          OUTPUT_FILE = "trufflehog.sarif"
+          def load_lines(path: str):
+              p = Path(path)
+              if not p.exists():
+                  print(f"[trufflehog_to_sarif] {path} introuvable, SARIF vide généré.", file=sys.stderr)
+                  return []
+              records = []
+              with p.open("r", encoding="utf-8") as f:
+                  for line_no, line in enumerate(f, start=1):
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          records.append(json.loads(line))
+                      except json.JSONDecodeError as e:
+                          print(f"[trufflehog_to_sarif] ligne {line_no} invalide, ignorée: {e}", file=sys.stderr)
+              return records
+          def build_sarif(records: list) -> dict:
+              results = []
+              rules_seen = {}
+              for rec in records:
+                  detector_name = (
+                      rec.get("DetectorName")
+                      or rec.get("detectorName")
+                      or "unknown-detector"
+                  )
+                  verified = rec.get("Verified", rec.get("verified", False))
+                  source_meta = rec.get("SourceMetadata", {}) or rec.get("sourceMetadata", {})
+                  data = source_meta.get("Data", {}) or source_meta.get("data", {})
+                  git_info = data.get("Git", {}) or data.get("git", {})
+                  file_path = git_info.get("file") or git_info.get("File") or "unknown"
+                  line = git_info.get("line") or git_info.get("Line") or 1
+                  commit = git_info.get("commit") or git_info.get("Commit") or ""
+                  rule_id = f"trufflehog-{detector_name}"
+                  if rule_id not in rules_seen:
+                      rules_seen[rule_id] = {
+                          "id": rule_id,
+                          "name": detector_name,
+                          "shortDescription": {"text": f"Secret potentiel détecté par le détecteur {detector_name}"},
+                          "defaultConfiguration": {
+                              "level": "error" if verified else "warning"
+                          },
+                      }
+                  # IMPORTANT : ne jamais inclure la valeur brute du secret (Raw / RawV2),
+                  # uniquement le type de détecteur, le statut de vérification et l'emplacement.
+                  message_text = f"Secret potentiel ({detector_name}), vérifié: {bool(verified)}"
+                  if commit:
+                      message_text += f" (commit {commit[:12]})"
+                  results.append(
+                      {
+                          "ruleId": rule_id,
+                          "level": "error" if verified else "warning",
+                          "message": {"text": message_text},
+                          "locations": [
+                              {
+                                  "physicalLocation": {
+                                      "artifactLocation": {"uri": file_path},
+                                      "region": {"startLine": int(line) if str(line).isdigit() else 1},
+                                  }
+                              }
+                          ],
+                          "properties": {
+                              "severity": "critical" if verified else "medium",
+                              "verified": bool(verified),
+                          },
+                      }
+                  )
+              sarif = {
+                  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+                  "version": "2.1.0",
+                  "runs": [
+                      {
+                          "tool": {
+                              "driver": {
+                                  "name": "TruffleHog",
+                                  "informationUri": "https://github.com/trufflesecurity/trufflehog",
+                                  "rules": list(rules_seen.values()),
+                              }
+                          },
+                          "results": results,
+                      }
+                  ],
+              }
+              return sarif
+          def main():
+              records = load_lines(INPUT_FILE)
+              sarif = build_sarif(records)
+              with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                  json.dump(sarif, f, ensure_ascii=False, indent=2)
+              print(f"[trufflehog_to_sarif] {len(records)} finding(s) converti(s) -> {OUTPUT_FILE}")
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 trufflehog_to_sarif.py
+      - name: Show TruffleHog SARIF results
+        run: cat trufflehog.sarif
+
+      - name: Upload TruffleHog SARIF
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sarif-trufflehog
+          path: trufflehog.sarif
+
+  process:
+    needs: [semgrep, gitleaks, bearer, pmd, dependency-check, trufflehog]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.run_scripts == true
+    env:
+      RUN_SCRIPTS: ${{ github.event_name != 'workflow_dispatch' || inputs.run_scripts == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Download SARIF artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: sarif-*
+          merge-multiple: true
+
+      - name: Upload raw SARIF bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: raw-sarif-bundle
+          path: |
+            semgrep.sarif
+            gitleaks.sarif
+            bearer.sarif
+            pmd.sarif
+            dependency-check.sarif
+            trufflehog.sarif
+      - name: Aggregate + anonymize findings
+        run: |
+          cat > anonymize.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          anonymize.py
+          1. Agrège les fichiers SARIF produits par les scanners (Semgrep, Gitleaks,
+             et Bearer si présent) en une liste de findings normalisée.
+          2. Anonymise le contenu sensible (secrets, emails, domaines, IPs, et termes
+             métier optionnels) AVANT tout envoi à une API externe.
+          Sortie : aggregated_findings.json (anonymisé), prêt à être consommé par
+          enrich_findings.py.
+          """
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+          SARIF_SOURCES = {
+              "semgrep": "semgrep.sarif",
+              "gitleaks": "gitleaks.sarif",
+              "bearer": "bearer.sarif",  # optionnel, ignoré si absent
+              "pmd": "pmd.sarif",  # optionnel, ignoré si absent
+              "dependency-check": "dependency-check.sarif",  # optionnel, ignoré si absent
+              "trufflehog": "trufflehog.sarif",  # optionnel, ignoré si absent
+          }
+          OUTPUT_FILE = "aggregated_findings.json"
+          # --- Patterns d'anonymisation génériques ---------------------------------
+          EMAIL_RE = re.compile(r"[\w\.\-+]+@[\w\-]+\.[\w\.\-]+")
+          DOMAIN_RE = re.compile(r"\b(?:[a-zA-Z0-9\-]+\.)+(?:com|net|org|io|fr|dev|co|app)\b")
+          IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+          # URL avec credentials type https://user:pass@host
+          URL_CREDS_RE = re.compile(r"://[^/\s:@]+:[^/\s:@]+@")
+          # Termes métier additionnels à masquer, fournis via variable d'env
+          # (liste séparée par des virgules), ex: ANONYMIZE_TERMS="AcmeCorp,ProjetX"
+          CUSTOM_TERMS = [
+              t.strip() for t in os.environ.get("ANONYMIZE_TERMS", "").split(",") if t.strip()
+          ]
+          def anonymize_text(text: str) -> str:
+              if not text:
+                  return text
+              text = EMAIL_RE.sub("[EMAIL_REDACTED]", text)
+              text = URL_CREDS_RE.sub("://[CREDENTIALS_REDACTED]@", text)
+              text = DOMAIN_RE.sub("[DOMAIN_REDACTED]", text)
+              text = IPV4_RE.sub("[IP_REDACTED]", text)
+              for term in CUSTOM_TERMS:
+                  if term:
+                      text = re.sub(re.escape(term), "[ORG_REDACTED]", text, flags=re.IGNORECASE)
+              return text
+          def load_sarif(path: str):
+              p = Path(path)
+              if not p.exists():
+                  print(f"[anonymize] {path} introuvable, ignoré.", file=sys.stderr)
+                  return None
+              try:
+                  with p.open("r", encoding="utf-8") as f:
+                      return json.load(f)
+              except json.JSONDecodeError as e:
+                  print(f"[anonymize] {path} invalide (JSON): {e}", file=sys.stderr)
+                  return None
+          def build_rule_severity_index(run: dict) -> dict:
+              """
+              Beaucoup d'outils (Semgrep, Gitleaks, Bearer) ne mettent pas 'level' sur
+              chaque result individuellement : ils le définissent une seule fois au
+              niveau de la règle, dans tool.driver.rules[].defaultConfiguration.level.
+              On indexe ça par ruleId pour pouvoir faire un fallback fiable.
+              """
+              index = {}
+              # NB: certains outils (bearer/pmd/dependency-check) peuvent renvoyer
+              # explicitement `null` pour "tool", "driver" ou "rules" plutôt que
+              # d'omettre la clé. `.get(key, default)` ne protège PAS contre ça
+              # (le default ne s'applique que si la clé est absente), d'où les
+              # `or {}` / `or []` explicites ci-dessous.
+              tool = run.get("tool") or {}
+              driver = tool.get("driver") or {}
+              rules = driver.get("rules") or []
+              for rule in rules:
+                  rule_id = rule.get("id")
+                  if not rule_id:
+                      continue
+                  level = rule.get("defaultConfiguration", {}).get("level")
+                  # Certains outils placent aussi une sévérité custom dans les properties de la règle
+                  custom_severity = (rule.get("properties") or {}).get("security-severity") or (
+                      rule.get("properties") or {}
+                  ).get("severity")
+                  if level:
+                      index[rule_id] = level
+                  elif custom_severity:
+                      index[rule_id] = custom_severity
+              return index
+          def extract_findings(tool: str, sarif: dict):
+              findings = []
+              if not sarif:
+                  return findings
+              # même remarque que ci-dessus : "runs" peut être `null`
+              for run in (sarif.get("runs") or []):
+                  driver = (run.get("tool") or {}).get("driver") or {}
+                  tool_name = driver.get("name", tool)
+                  rule_severity_index = build_rule_severity_index(run)
+                  # FIX : "results" peut être explicitement `null` (observé avec
+                  # certains scanners qui n'ont rien trouvé), ce qui faisait
+                  # planter la boucle avec `.get("results", [])` puisque le
+                  # default n'est utilisé que si la clé est absente.
+                  for result in (run.get("results") or []):
+                      rule_id = result.get("ruleId", "unknown")
+                      message = (result.get("message") or {}).get("text", "")
+                      severity = (
+                          (result.get("properties") or {}).get("severity")
+                          or result.get("level")
+                          or rule_severity_index.get(rule_id)
+                          or "unknown"
+                      )
+                      locations = []
+                      for loc in (result.get("locations") or []):
+                          phys = loc.get("physicalLocation") or {}
+                          file_path = (phys.get("artifactLocation") or {}).get("uri", "unknown")
+                          start_line = (phys.get("region") or {}).get("startLine")
+                          locations.append({"file": file_path, "line": start_line})
+                      # Pour Gitleaks : ne JAMAIS conserver la valeur du secret elle-même,
+                      # uniquement le type de règle déclenchée et l'emplacement.
+                      if tool == "gitleaks":
+                          message = f"Secret potentiel détecté (règle: {rule_id})"
+                      findings.append(
+                          {
+                              "tool": tool_name,
+                              "rule_id": rule_id,
+                              "severity": severity,
+                              "message": anonymize_text(message),
+                              "locations": locations,
+                          }
+                      )
+              return findings
+          SECRET_TOOLS = {"gitleaks", "trufflehog"}
+          # En cas de doublon exact (même fichier + même ligne), quel outil on garde.
+          # TruffleHog est prioritaire car il fournit un statut de vérification (secret
+          # actif ou non), une info que Gitleaks ne donne pas.
+          PREFERRED_SECRET_TOOL = "trufflehog"
+          def deduplicate_secret_findings(findings: list) -> list:
+              """
+              Gitleaks et TruffleHog détectent tous les deux des secrets hardcodés.
+              Quand les deux remontent un finding au même emplacement (fichier:ligne),
+              on ne garde qu'une seule entrée (TruffleHog, plus riche) au lieu de
+              dupliquer le même problème deux fois dans le rapport final.
+              """
+              secret_findings = []
+              other_findings = []
+              for f in findings:
+                  tool_lower = str(f.get("tool", "")).lower()
+                  if tool_lower in SECRET_TOOLS:
+                      secret_findings.append(f)
+                  else:
+                      other_findings.append(f)
+              # Regroupe les findings "secrets" par (fichier, ligne) du 1er emplacement
+              groups = {}
+              for f in secret_findings:
+                  locations = f.get("locations") or [{"file": "unknown", "line": None}]
+                  key = (locations[0].get("file"), locations[0].get("line"))
+                  groups.setdefault(key, []).append(f)
+              deduplicated = []
+              for key, group in groups.items():
+                  if len(group) == 1 or key[0] == "unknown":
+                      deduplicated.extend(group)
+                      continue
+                  tools_at_location = {str(f.get("tool", "")).lower() for f in group}
+                  if SECRET_TOOLS.issubset(tools_at_location):
+                      # Doublon confirmé par les deux outils : on garde le préféré,
+                      # et on note que l'autre l'a aussi détecté.
+                      kept = next(
+                          (f for f in group if str(f.get("tool", "")).lower() == PREFERRED_SECRET_TOOL),
+                          group[0],
+                      )
+                      other_tools = sorted(
+                          t for t in tools_at_location if t != str(kept.get("tool", "")).lower()
+                      )
+                      kept = dict(kept)
+                      kept["confirmed_by"] = [kept.get("tool")] + [t.capitalize() for t in other_tools]
+                      deduplicated.append(kept)
+                      print(
+                          f"[anonymize] doublon secret dédupliqué à {key[0]}:{key[1]} "
+                          f"(confirmé par {', '.join(kept['confirmed_by'])})"
+                      )
+                  else:
+                      # Même position mais outils différents non-secrets a priori (cas rare) : on garde tout
+                      deduplicated.extend(group)
+              return other_findings + deduplicated
+          def main():
+              all_findings = []
+              for tool, filename in SARIF_SOURCES.items():
+                  sarif = load_sarif(filename)
+                  found = extract_findings(tool, sarif)
+                  print(f"[anonymize] {tool}: {len(found)} finding(s)")
+                  all_findings.extend(found)
+              before_count = len(all_findings)
+              all_findings = deduplicate_secret_findings(all_findings)
+              removed = before_count - len(all_findings)
+              if removed:
+                  print(f"[anonymize] {removed} doublon(s) secret(s) retiré(s) après déduplication Gitleaks/TruffleHog")
+              output = {
+                  "generated_at": datetime.now(timezone.utc).isoformat(),
+                  "total_findings": len(all_findings),
+                  "findings": all_findings,
+              }
+              with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                  json.dump(output, f, ensure_ascii=False, indent=2)
+              print(f"[anonymize] {len(all_findings)} finding(s) agrégé(s) et anonymisé(s) -> {OUTPUT_FILE}")
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 anonymize.py
+      - name: Upload aggregated findings
+        if: env.RUN_SCRIPTS == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aggregated-findings
+          path: aggregated_findings.json
+
+      - name: AI enrichment (triage + suggested patch)
+        if: env.RUN_SCRIPTS == 'true'
+        env:
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'groq' }}  # 'groq' ou 'gemini', variable de repo
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL }}  # optionnel, sinon valeur par défaut par provider
+        run: |
+          cat > enrich_findings.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          enrich_findings.py
+          Prend aggregated_findings.json (déjà anonymisé) et appelle une API IA
+          (Groq ou Gemini, au choix) pour obtenir, par finding :
+            - une estimation de faux positif
+            - une priorité de traitement
+            - une suggestion de patch (texte court, pas de diff complet)
+          Variables d'environnement :
+            AI_PROVIDER   "groq" ou "gemini"          (défaut: "groq")
+            AI_API_KEY    clé API (secret GitHub)     (obligatoire)
+            AI_MODEL      nom du modèle               (optionnel, valeur par défaut par provider)
+          Sortie : enriched_findings.json
+          """
+          import json
+          import os
+          import sys
+          import urllib.request
+          import urllib.error
+          INPUT_FILE = "aggregated_findings.json"
+          OUTPUT_FILE = "enriched_findings.json"
+          DEFAULT_MODELS = {
+              "groq": "llama-3.3-70b-versatile",
+              "gemini": "gemini-2.0-flash",
+          }
+          # On batch les findings par paquets pour rester sous les limites de rate/contexte
+          BATCH_SIZE = 15
+          SYSTEM_PROMPT = (
+              "Tu es un assistant de triage de sécurité applicative. On te donne une liste "
+              "de findings SAST/secrets (anonymisés, sans données sensibles réelles). "
+              "Pour CHAQUE finding, dans le même ordre, retourne un objet JSON avec exactement "
+              "ces clés : false_positive_likelihood (low|medium|high), priority "
+              "(critical|high|medium|low), suggested_patch (une explication courte, en français, "
+              "de comment corriger — pas de diff complet, juste l'idée du correctif). "
+              "Réponds UNIQUEMENT avec un tableau JSON valide, rien d'autre, pas de markdown."
+          )
+          def call_groq(api_key: str, model: str, findings_batch: list) -> list:
+              url = "https://api.groq.com/openai/v1/chat/completions"
+              payload = {
+                  "model": model,
+                  "messages": [
+                      {"role": "system", "content": SYSTEM_PROMPT},
+                      {"role": "user", "content": json.dumps(findings_batch, ensure_ascii=False)},
+                  ],
+                  "temperature": 0.1,
+              }
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json",
+                      "User-Agent": "sast-pipeline/1.0 (+github-actions)",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  data = json.loads(resp.read().decode("utf-8"))
+              text = data["choices"][0]["message"]["content"]
+              return parse_json_array(text)
+          def call_gemini(api_key: str, model: str, findings_batch: list) -> list:
+              url = (
+                  f"https://generativelanguage.googleapis.com/v1beta/models/"
+                  f"{model}:generateContent?key={api_key}"
+              )
+              payload = {
+                  "contents": [
+                      {
+                          "parts": [
+                              {
+                                  "text": SYSTEM_PROMPT
+                                  + "\n\nFindings:\n"
+                                  + json.dumps(findings_batch, ensure_ascii=False)
+                              }
+                          ]
+                      }
+                  ],
+                  "generationConfig": {"temperature": 0.1},
+              }
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  data = json.loads(resp.read().decode("utf-8"))
+              text = data["candidates"][0]["content"]["parts"][0]["text"]
+              return parse_json_array(text)
+          PROVIDERS = {"groq": call_groq, "gemini": call_gemini}
+          def parse_json_array(text: str) -> list:
+              """Nettoie les éventuels fences markdown puis parse le JSON."""
+              cleaned = text.strip()
+              if cleaned.startswith("```"):
+                  cleaned = cleaned.strip("`")
+                  cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned
+              cleaned = cleaned.replace("json\n", "", 1) if cleaned.startswith("json\n") else cleaned
+              return json.loads(cleaned)
+          def fallback_enrichment(count: int) -> list:
+              return [
+                  {
+                      "false_positive_likelihood": "unknown",
+                      "priority": "unknown",
+                      "suggested_patch": "Enrichissement IA indisponible (erreur API ou parsing).",
+                  }
+                  for _ in range(count)
+              ]
+          def chunk(lst, size):
+              for i in range(0, len(lst), size):
+                  yield lst[i : i + size]
+          def main():
+              provider = os.environ.get("AI_PROVIDER", "groq").lower()
+              api_key = os.environ.get("AI_API_KEY")
+              model = os.environ.get("AI_MODEL") or DEFAULT_MODELS.get(provider)
+              if provider not in PROVIDERS:
+                  print(f"[enrich] Provider inconnu: {provider}", file=sys.stderr)
+                  sys.exit(1)
+              if not api_key:
+                  print("[enrich] AI_API_KEY manquant.", file=sys.stderr)
+                  sys.exit(1)
+              with open(INPUT_FILE, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+              aggregated_at = data.get("generated_at")
+              findings = data.get("findings", [])
+              if not findings:
+                  print("[enrich] Aucun finding à enrichir.")
+                  with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                      json.dump(
+                          {
+                              "aggregated_at": aggregated_at,
+                              "enriched_at": datetime.now(timezone.utc).isoformat(),
+                              "findings": [],
+                          },
+                          f, ensure_ascii=False, indent=2,
+                      )
+                  return
+              call_fn = PROVIDERS[provider]
+              enriched_all = []
+              for batch in chunk(findings, BATCH_SIZE):
+                  try:
+                      enrichment = call_fn(api_key, model, batch)
+                      if len(enrichment) != len(batch):
+                          raise ValueError(
+                              f"Taille de réponse inattendue: {len(enrichment)} vs {len(batch)} findings"
+                          )
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode("utf-8", errors="replace")
+                      print(f"[enrich] Erreur HTTP sur un batch ({provider}): {e.code} {e.reason} — {body}", file=sys.stderr)
+                      enrichment = fallback_enrichment(len(batch))
+                  except (urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as e:
+                      print(f"[enrich] Erreur sur un batch ({provider}): {e}", file=sys.stderr)
+                      enrichment = fallback_enrichment(len(batch))
+                  for original, enrich in zip(batch, enrichment):
+                      merged = dict(original)
+                      merged.update(enrich)
+                      enriched_all.append(merged)
+              with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                  json.dump({"findings": enriched_all}, f, ensure_ascii=False, indent=2)
+              print(f"[enrich] {len(enriched_all)} finding(s) enrichi(s) via {provider} -> {OUTPUT_FILE}")
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 enrich_findings.py
+      - name: Upload enriched findings
+        if: env.RUN_SCRIPTS == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: enriched-findings
+          path: enriched_findings.json
+
+      - name: Convert to rdjsonl
+        run: |
+          cat > to_rdjsonl.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          to_rdjsonl.py
+          Convertit enriched_findings.json (findings anonymisés + enrichis par l'IA)
+          en format rdjsonl, consommé par reviewdog pour poster des commentaires
+          inline sur la PR.
+          Format rdjsonl attendu par reviewdog (une ligne JSON par finding) :
+          {
+            "message": "texte affiché dans le commentaire",
+            "location": {
+              "path": "chemin/du/fichier",
+              "range": {"start": {"line": N}}
+            },
+            "severity": "ERROR|WARNING|INFO"
+          }
+          Doc: https://github.com/reviewdog/reviewdog#rdjsonl
+          Entrée : enriched_findings.json
+          Sortie : findings.rdjsonl
+          """
+          import json
+          import sys
+          from pathlib import Path
+          INPUT_FILE = "enriched_findings.json"
+          OUTPUT_FILE = "findings.rdjsonl"
+          # Mapping priorité IA -> sévérité reviewdog
+          PRIORITY_TO_SEVERITY = {
+              "critical": "ERROR",
+              "high": "ERROR",
+              "medium": "WARNING",
+              "low": "INFO",
+              "unknown": "INFO",
+          }
+          def build_message(finding: dict) -> str:
+              tool = finding.get("tool", "unknown")
+              rule_id = finding.get("rule_id", "unknown")
+              message = finding.get("message", "")
+              priority = finding.get("priority", "unknown")
+              fp_likelihood = finding.get("false_positive_likelihood", "unknown")
+              patch = finding.get("suggested_patch", "")
+              lines = [
+                  f"**[{tool}] {rule_id}** — priorité: `{priority}` (faux positif probable: `{fp_likelihood}`)",
+                  "",
+                  message,
+              ]
+              if patch:
+                  lines += ["", f"💡 **Suggestion:** {patch}"]
+              return "\n".join(lines)
+          def main():
+              p = Path(INPUT_FILE)
+              if not p.exists():
+                  print(f"[rdjsonl] {INPUT_FILE} introuvable.", file=sys.stderr)
+                  sys.exit(1)
+              with p.open("r", encoding="utf-8") as f:
+                  data = json.load(f)
+              findings = data.get("findings", [])
+              count = 0
+              with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+                  for finding in findings:
+                      locations = finding.get("locations") or [{"file": "unknown", "line": 1}]
+                      severity = PRIORITY_TO_SEVERITY.get(
+                          str(finding.get("priority", "unknown")).lower(), "INFO"
+                      )
+                      message = build_message(finding)
+                      # Un commentaire par emplacement (un finding peut toucher plusieurs lignes/fichiers)
+                      for loc in locations:
+                          file_path = loc.get("file", "unknown")
+                          line = loc.get("line") or 1
+                          if file_path == "unknown":
+                              # reviewdog a besoin d'un chemin de fichier valide, on saute sinon
+                              continue
+                          record = {
+                              "message": message,
+                              "location": {
+                                  "path": file_path,
+                                  "range": {"start": {"line": int(line)}},
+                              },
+                              "severity": severity,
+                          }
+                          out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                          count += 1
+              print(f"[rdjsonl] {count} commentaire(s) écrit(s) -> {OUTPUT_FILE}")
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 to_rdjsonl.py
+      - name: Setup reviewdog
+        if: env.RUN_SCRIPTS == 'true' && github.event_name == 'pull_request'
+        uses: reviewdog/action-setup@38a8d76742a75eeb6c6ffc616bde64179fd09ebf
+        with:
+          reviewdog_version: latest
+
+      - name: Post inline PR comments (reviewdog)
+        if: env.RUN_SCRIPTS == 'true' && github.event_name == 'pull_request'
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat findings.rdjsonl | reviewdog -f=rdjsonl -name="security-pipeline" -reporter=github-pr-review -filter-mode=nofilter -fail-level=any || true
+      - name: Write Job Summary (full, with AI enrichment)
+        if: env.RUN_SCRIPTS == 'true'
+        run: |
+          cat > job_summary.py <<'PYEOF'
+          import json
+          with open('enriched_findings.json', encoding='utf-8') as f:
+              data = json.load(f)
+          findings = data.get('findings', [])
+          print(f'**Total findings:** {len(findings)}')
+          print()
+          by_priority = {}
+          for finding in findings:
+              p = finding.get('priority', 'unknown')
+              by_priority[p] = by_priority.get(p, 0) + 1
+          if by_priority:
+              print('| Priorité | Nombre |')
+              print('|---|---|')
+              for p in ['critical', 'high', 'medium', 'low', 'unknown']:
+                  if p in by_priority:
+                      print(f'| {p} | {by_priority[p]} |')
+          else:
+              print('Aucun finding détecté ✅')
+          print()
+          if findings:
+              print('### Détail des findings')
+              print()
+              print('| Priorité | Fichier | Vulnérabilité | Recommandation |')
+              print('|---|---|---|---|')
+              priority_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'unknown': 4}
+              sorted_findings = sorted(
+                  findings,
+                  key=lambda x: priority_order.get(str(x.get('priority', 'unknown')).lower(), 5)
+              )
+              def esc(text):
+                  if not text:
+                      return ''
+                  return str(text).replace('|', '\\\\|').replace(chr(10), ' ').strip()
+              for finding in sorted_findings:
+                  priority = finding.get('priority', 'unknown')
+                  tool = finding.get('tool', 'unknown')
+                  rule_id = finding.get('rule_id', 'unknown')
+                  message = finding.get('message', '')
+                  patch = finding.get('suggested_patch', 'N/A')
+                  locations = finding.get('locations') or [{'file': 'unknown', 'line': '?'}]
+                  file_cell = '<br>'.join(
+                      f"`{loc.get('file', 'unknown')}:{loc.get('line', '?')}`" for loc in locations
+                  )
+                  vuln_cell = f'**[{esc(tool)}] {esc(rule_id)}**<br>{esc(message)}'
+                  reco_cell = esc(patch)
+                  print(f'| {priority} | {file_cell} | {vuln_cell} | {reco_cell} |')
+          PYEOF
+          {
+            echo "## 🔎 Rapport Security Pipeline"
+            echo ""
+            python3 job_summary.py
+          } > report_summary.md
+          cat report_summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Write Job Summary (raw SARIF only, scripts disabled)
+        if: env.RUN_SCRIPTS != 'true'
+        run: |
+          {
+            echo "## 🔎 Rapport Security Pipeline (mode brut, sans scripts)"
+            echo ""
+            echo "L'agrégation, l'anonymisation, l'enrichissement IA et reviewdog ont été désactivés pour ce run."
+            echo ""
+            echo "Les fichiers SARIF bruts de chaque scanner sont disponibles dans l'artifact \`raw-sarif-bundle\`."
+          } > report_summary.md
+          cat report_summary.md >> "$GITHUB_STEP_SUMMARY"
+      # ---------------------------------------------------------------------
+      # À partir d'ici : génération du PDF horodaté + publication dans le
+      # dépôt "results". S'exécute à chaque run (if: always()), que les
+      # scripts IA/anonymisation aient tourné ou non.
+      # ---------------------------------------------------------------------
+
+      - name: Generate timestamp
+        if: always()
+        run: echo "TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: Save job summary to file
+        if: always()
+        run: |
+          if [ ! -s report_summary.md ]; then
+            cp "$GITHUB_STEP_SUMMARY" report_summary.md || true
+          fi
+      - name: Generate PDF report
+        if: always()
+        run: |
+          pip install markdown xhtml2pdf
+          cat > generate_pdf.py <<'PYEOF'
+          #!/usr/bin/env python3
+          import os
+          import re
+          import markdown
+          from xhtml2pdf import pisa
+          
+          def preprocess_md_for_pdf(md_text):
+              text = md_text.replace(chr(13) + chr(10), chr(10)).replace(chr(13), chr(10))
+          
+              def escape_html_in_line(line):
+                  if re.match(r"^\s*\|?[-:\s|]+\|?\s*$", line):
+                      return line
+                  line = line.replace("&", "&amp;")
+                  line = line.replace("<", "&lt;")
+                  line = line.replace(">", "&gt;")
+                  line = line.replace("&amp;lt;", "&lt;")
+                  line = line.replace("&amp;gt;", "&gt;")
+                  line = line.replace("&amp;amp;", "&amp;")
+                  return line
+          
+              lines = text.split(chr(10))
+              processed_lines = []
+              in_code_block = False
+          
+              for line in lines:
+                  stripped = line.strip()
+                  if stripped.startswith("```"):
+                      in_code_block = not in_code_block
+                      processed_lines.append(line)
+                      continue
+                  if in_code_block:
+                      processed_lines.append(line)
+                      continue
+                  if "|" in line:
+                      processed_lines.append(escape_html_in_line(line))
+                  else:
+                      processed_lines.append(line)
+          
+              return chr(10).join(processed_lines)
+          
+          def postprocess_html_for_pdf(html_text):
+              html_text = re.sub(r"<br\s*/?>", " ", html_text, flags=re.IGNORECASE)
+              html_text = html_text.replace("<table>", '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse; width: 100%;">')
+              html_text = html_text.replace("<th>", '<th style="background-color: #f0f0f0; border: 1px solid #999; padding: 6px; text-align: left; vertical-align: top; word-wrap: break-word;">')
+              html_text = html_text.replace("<td>", '<td style="border: 1px solid #999; padding: 6px; text-align: left; vertical-align: top; word-wrap: break-word;">')
+              return html_text
+          
+          with open("report_summary.md", encoding="utf-8") as f:
+              md_text = f.read()
+          
+          md_text = preprocess_md_for_pdf(md_text)
+          html_body = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
+          html_body = postprocess_html_for_pdf(html_body)
+          
+          html = f"""<!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <style>
+                @page {{
+                  size: A4 landscape;
+                  margin: 1.5cm;
+                }}
+                body {{
+                  font-family: Helvetica, Arial, sans-serif;
+                  font-size: 9px;
+                  line-height: 1.4;
+                  color: #333;
+                }}
+                h1, h2, h3 {{
+                  color: #1a1a1a;
+                  margin-top: 16px;
+                  margin-bottom: 8px;
+                }}
+                h1 {{ font-size: 16px; border-bottom: 2px solid #333; padding-bottom: 4px; }}
+                h2 {{ font-size: 13px; border-bottom: 1px solid #ccc; padding-bottom: 3px; }}
+                h3 {{ font-size: 11px; }}
+                table {{
+                  border-collapse: collapse;
+                  width: 100%;
+                  table-layout: fixed;
+                  margin: 10px 0;
+                }}
+                th, td {{
+                  border: 1px solid #999;
+                  padding: 5px;
+                  text-align: left;
+                  vertical-align: top;
+                  word-wrap: break-word;
+                  overflow: hidden;
+                }}
+                th {{
+                  background-color: #e8e8e8;
+                  font-weight: bold;
+                  font-size: 8px;
+                  text-transform: uppercase;
+                }}
+                td {{ font-size: 8px; }}
+                th:nth-child(1), td:nth-child(1) {{ width: 10%; }}
+                th:nth-child(2), td:nth-child(2) {{ width: 25%; }}
+                th:nth-child(3), td:nth-child(3) {{ width: 35%; }}
+                th:nth-child(4), td:nth-child(4) {{ width: 30%; }}
+                code {{
+                  background-color: #f4f4f4;
+                  padding: 1px 3px;
+                  border-radius: 2px;
+                  font-family: Consolas, Monaco, monospace;
+                  font-size: 8px;
+                }}
+                pre {{
+                  background-color: #f4f4f4;
+                  padding: 8px;
+                  border-radius: 3px;
+                  overflow-x: auto;
+                  white-space: pre-wrap;
+                  word-wrap: break-word;
+                }}
+                pre code {{
+                  background-color: transparent;
+                  padding: 0;
+                }}
+                p {{ margin: 6px 0; }}
+                ul, ol {{ margin: 6px 0; padding-left: 20px; }}
+                li {{ margin: 2px 0; }}
+                strong {{ color: #000; }}
+              </style>
+            </head>
+            <body>{html_body}</body>
+          </html>"""
+          
+          filename = f"results_{os.environ['TIMESTAMP']}.pdf"
+          with open(filename, "wb") as out:
+              result = pisa.CreatePDF(html, dest=out)
+          
+          if result.err:
+              print(f"[generate_pdf] Erreurs PDF : {result.err}")
+          else:
+              print(f"[generate_pdf] PDF généré : {filename}")
+          PYEOF
+          python3 generate_pdf.py
+      - name: Upload PDF as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: results-pdf
+          path: results_*.pdf
+
+      # GitHub Actions interdit de référencer `secrets.*` directement dans un
+      # `if:`. On passe donc par une variable d'environnement calculée ici,
+      # réutilisable dans les `if:` des étapes suivantes.
+      - name: Check if results publishing is configured
+        if: always()
+        env:
+          RESULTS_TOKEN_CHECK: ${{ secrets.RESULTS_REPO_TOKEN }}
+        run: |
+          if [ -n "$RESULTS_TOKEN_CHECK" ]; then
+            echo "PUBLISH_RESULTS=true" >> "$GITHUB_ENV"
+          else
+            echo "PUBLISH_RESULTS=false" >> "$GITHUB_ENV"
+          fi
+      - name: Ensure results repository exists
+        if: env.PUBLISH_RESULTS == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RESULTS_REPO_TOKEN }}
+        run: |
+          OWNER="${{ vars.RESULTS_REPO_OWNER || github.repository_owner }}"
+          if gh repo view "$OWNER/results" >/dev/null 2>&1; then
+            echo "Le dépôt $OWNER/results existe déjà."
+          else
+            echo "Le dépôt $OWNER/results n'existe pas, création..."
+            gh repo create "$OWNER/results" --private --add-readme -y
+          fi
+      - name: Checkout results repository
+        if: env.PUBLISH_RESULTS == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: ${{ vars.RESULTS_REPO_OWNER || github.repository_owner }}/results
+          token: ${{ secrets.RESULTS_REPO_TOKEN }}
+          path: results-repo
+
+      - name: Publish PDF and SARIF to results repository
+        if: env.PUBLISH_RESULTS == 'true'
+        run: |
+          mkdir -p results-repo/reports
+          cp results_*.pdf results-repo/reports/
+          cp semgrep.sarif gitleaks.sarif bearer.sarif pmd.sarif dependency-check.sarif trufflehog.sarif results-repo/reports/ 2>/dev/null || true
+          cd results-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          git commit -m "Rapport de sécurité ${TIMESTAMP} (run ${{ github.run_id }})" || echo "Rien à committer"
+          git push
+      - name: Warn if publication skipped
+        if: env.PUBLISH_RESULTS == 'false'
+        run: |
+          echo "::warning::RESULTS_REPO_TOKEN n'est pas défini : le PDF n'a pas été publié dans le dépôt results (il reste disponible en artifact 'results-pdf')."
